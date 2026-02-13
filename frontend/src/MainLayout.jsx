@@ -91,16 +91,15 @@ export default function MainLayout() {
         }
     };
 
+    // FIX #9: Guard against null userCallArgs, disconnect synchronously
     useEffect(() => {
         if(!socket) return;
         const handleBeforeUnload = () => {
-            if (peerConnectionRef.current) {
+            if (peerConnectionRef.current && userCallArgs.current) {
                 socket.emit('webrtc-hangup', {my_id: account._id, ...userCallArgs.current});
             }
             socket.off()
-            setTimeout(() => {
-                socket.disconnect();
-            }, 100);
+            socket.disconnect();
         };
     
         window.addEventListener('beforeunload', handleBeforeUnload);
@@ -138,7 +137,7 @@ export default function MainLayout() {
     
     useEffect(() => {
         if(verify === 0) return
-        const socketInstance = io('https://nextalk-production.up.railway.app', {
+        const socketInstance = io('https://nextalk-production-8804.up.railway.app', {
             transports: ['websocket'],
             withCredentials: true
         })
@@ -378,9 +377,10 @@ export default function MainLayout() {
                             {!localMicOn ? <div className='rotate-45 self-center left-[calc(54%-2px)] absolute h-[80%] w-[2px] rounded-full bg-white'></div> : <></>}
                             <MicIcon/>
                         </button>
+                        {/* FIX #8: Allow hangup even before message_id arrives (cancel outgoing call) */}
                         <button className={`${!isOnCall ? 'opacity-50' : ''} rounded-full p-3 bg-red-500`}
                             onClick={() => {
-                                if(!userCallArgs.current || !userCallArgs.current.message_id) return
+                                if(!userCallArgs.current) return
                                 socket.emit('webrtc-hangup', {my_id: account._id, ...userCallArgs.current})
                             }}
                         >

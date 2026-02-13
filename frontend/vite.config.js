@@ -11,7 +11,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:3000',
+        target: 'https://nextalk-production-8804.up.railway.app',
         changeOrigin: true,
         secure: false
       }

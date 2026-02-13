@@ -33,6 +33,9 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
     const pickerRef = useRef(null)
     const chatAreaRef = useRef(null)
 
+    // FIX #1: Buffer for ICE candidates that arrive before remote description is set
+    const pendingIceCandidates = useRef([])
+
     const {
         peerConnectionRef,
         localVideoRef,
@@ -94,10 +97,14 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
         socketInstance.on('current status', currentStatus)
         socketInstance.on('receive message', receiveMessage)
         
+        // FIX #1: Buffer ICE candidates that arrive before remote description is set
         socketInstance.on("webrtc-ice-candidate", async ({ candidate }) => {
             const pc = peerConnectionRef.current;
+            if (!pc) return;
+
             if (!pc.remoteDescription || pc.remoteDescription.type === "") {
-                return
+                // Buffer instead of silently dropping
+                pendingIceCandidates.current.push(candidate);
             } else {
                 try {
                     await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -113,6 +120,16 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
                 await peerConnectionRef.current.setRemoteDescription(
                     new RTCSessionDescription(answer)
                 );
+
+                // FIX #1: Flush all buffered ICE candidates now that remote description is set
+                for (const candidate of pendingIceCandidates.current) {
+                    try {
+                        await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+                    } catch (err) {
+                        console.error("Error adding buffered ice candidate", err);
+                    }
+                }
+                pendingIceCandidates.current = [];
             }
         });
 
@@ -123,7 +140,6 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
         socketInstance.on('webrtc-hangup', async ({ user_id }) => {
             if(userCallArgs.current && userCallArgs.current.user_id === user_id) {
                 cleanupConnection()
-                userCallArgs.current = null
             }
         })
 
@@ -161,27 +177,42 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
         setRemoteMicOn(true)
         setLocalCamOn(true)
         setRemoteCamOn(true)
+
+        // FIX #4 & #7: Clear call state on every cleanup path
+        userCallArgs.current = null
+        callerName.current = null
+        pendingIceCandidates.current = []
     };
 
     const startCall = async (video) => {
+        // FIX #6: Wrap getUserMedia in try-catch
+        let localStream;
+        try {
+            // FIX #3: Only request video if it's a video call
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: video,
+                audio: true
+            });
+        } catch (err) {
+            console.error("Failed to access media devices:", err);
+            alert("Could not access your camera/microphone. Please check permissions.");
+            return null;
+        }
+
         setIsOnCall(true)
         const peerConnection = new RTCPeerConnection(iceConfig);
         peerConnectionRef.current = peerConnection;
 
-        const localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         if (localVideoRef.current) localVideoRef.current.srcObject = localStream;
         
         localStream.getTracks().forEach(track => {
             peerConnection.addTrack(track, localStream);
         });
 
+        // FIX #2: For audio calls, only set LOCAL cam off (remote cam state comes from remote peer)
         if(!video) {
-            const videoTrack = localVideoRef.current.srcObject?.getVideoTracks()[0];
-            if (videoTrack) {
-                videoTrack.enabled = false;
-                setLocalCamOn(false);
-                setRemoteCamOn(false)
-            }
+            setLocalCamOn(false);
+            // Don't set setRemoteCamOn(false) here — that's determined by the remote peer
         }
         
         const iceCandidates = []
@@ -199,17 +230,30 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
 
         await peerConnection.setLocalDescription(await peerConnection.createOffer());
         
-        // ✅ Wait for ICE gathering to complete
-        await new Promise(resolve => {
-            const checkIce = () => {
-                if (peerConnection.iceGatheringState === 'complete') {
-                    resolve()
-                } else {
-                    setTimeout(checkIce, 100)
-                }
+        // FIX #5: Use event listener instead of fragile polling, with a timeout safety net
+        await new Promise((resolve, reject) => {
+            if (peerConnection.iceGatheringState === 'complete') {
+                resolve();
+                return;
             }
-            checkIce()
-        })
+
+            const timeout = setTimeout(() => {
+                // Safety: resolve after 10s even if gathering isn't complete
+                // (we'll have partial candidates which is usually enough)
+                peerConnection.removeEventListener('icegatheringstatechange', onGatheringComplete);
+                resolve();
+            }, 10000);
+
+            const onGatheringComplete = () => {
+                if (peerConnection.iceGatheringState === 'complete') {
+                    clearTimeout(timeout);
+                    peerConnection.removeEventListener('icegatheringstatechange', onGatheringComplete);
+                    resolve();
+                }
+            };
+
+            peerConnection.addEventListener('icegatheringstatechange', onGatheringComplete);
+        });
 
         return {
             offer: peerConnection.localDescription,
@@ -218,24 +262,34 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
     }
 
     const answerCall = async (message_id, offer, video) => {
+        // FIX #6: Wrap getUserMedia in try-catch
+        let localStream;
+        try {
+            // FIX #3: Only request video if it's a video call
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: video,
+                audio: true
+            });
+        } catch (err) {
+            console.error("Failed to access media devices:", err);
+            alert("Could not access your camera/microphone. Please check permissions.");
+            return;
+        }
+
         setIsOnCall(true)
 
         const peerConnection = new RTCPeerConnection(iceConfig);
         peerConnectionRef.current = peerConnection;
 
-        const localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
         if (localVideoRef.current) localVideoRef.current.srcObject = localStream;
         localStream.getTracks().forEach((track) => {
             peerConnection.addTrack(track, localStream);
         });
         
+        // FIX #2: For audio calls, only set LOCAL cam off
         if(!video) {
-            const videoTrack = localVideoRef.current.srcObject?.getVideoTracks()[0];
-            if (videoTrack) {
-                videoTrack.enabled = false;
-                setLocalCamOn(false);
-                setRemoteCamOn(false)
-            }
+            setLocalCamOn(false);
+            // Don't set setRemoteCamOn(false) here
         }
 
         peerConnection.onicecandidate = (event) => {
@@ -259,7 +313,6 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
             new RTCSessionDescription(offer.offer)
         );
 
-        // ✅ Loop through and add each ICE candidate individually
         for (const candidate of offer.iceCandidates) {
             try {
                 await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
@@ -409,6 +462,12 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
                                         callerName.current = data.user.username
                                         userCallArgs.current = { user_id: data.user._id, chat_id: data.chat._id }
                                         const callOffer = await startCall(true)
+                                        // FIX #6: If getUserMedia failed, startCall returns null
+                                        if (!callOffer) {
+                                            userCallArgs.current = null
+                                            callerName.current = null
+                                            return
+                                        }
                                         socket.emit('send message', {sender_id: account._id, receiver_id: chatInfo.user_id, chat_id: data.chat._id, callOffer, typeOfCall: 'Video', message: input.trim()})
                                         }}
                                         className={`${isOnCall ? 'opacity-55' : 'active:opacity-55'} cursor-pointer`}
@@ -422,6 +481,12 @@ export default function ChatArea({ connectionVars, isOnCall, setIsOnCall, accoun
                                         callerName.current = data.user.username
                                         userCallArgs.current = { user_id: data.user._id, chat_id: data.chat._id }
                                         const callOffer = await startCall(false)
+                                        // FIX #6: If getUserMedia failed, startCall returns null
+                                        if (!callOffer) {
+                                            userCallArgs.current = null
+                                            callerName.current = null
+                                            return
+                                        }
                                         socket.emit('send message', {sender_id: account._id, receiver_id: chatInfo.user_id, chat_id: data.chat._id, callOffer, typeOfCall: 'Audio', message: input.trim()})
                                     }}
                                     className={`${isOnCall ? 'opacity-55' : 'active:opacity-55'} cursor-pointer`}
